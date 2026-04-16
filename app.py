@@ -1,8 +1,7 @@
 import streamlit as st
-from databricks import sql
-import os
-import re
+from databricks.sdk import WorkspaceClient
 from datetime import datetime, timedelta
+import re
 
 # -------------------------
 # CONFIG
@@ -10,83 +9,98 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="Check-in da reunião")
 
 st.title("Antes de entrar na reunião")
+st.write("Preencha seus dados para continuar")
 
 # -------------------------
-# DATABRICKS (via secrets)
+# CLIENTE DATABRICKS
 # -------------------------
-SERVER_HOSTNAME = os.environ["DATABRICKS_HOST"]
-HTTP_PATH = os.environ["DATABRICKS_HTTP_PATH"]
-ACCESS_TOKEN = os.environ["DATABRICKS_TOKEN"]
-
-# -------------------------
-# PEGAR PARAM
-# -------------------------
-params = st.query_params
-meeting_id = params.get("meeting_id")
-
-if isinstance(meeting_id, list):
-    meeting_id = meeting_id[0]
-
-if not meeting_id:
-    st.error("Link inválido")
-    st.stop()
+w = WorkspaceClient()
+WAREHOUSE_ID = "seu_id"
 
 # -------------------------
 # FUNÇÕES SQL
 # -------------------------
 def run_query(query):
-    with sql.connect(
-        server_hostname=SERVER_HOSTNAME,
-        http_path=HTTP_PATH,
-        access_token=ACCESS_TOKEN,
-    ) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(query)
-            rows = cursor.fetchall()
-            columns = [col[0] for col in cursor.description]
-            return rows, columns
+    result = w.statement_execution.execute_statement(
+        warehouse_id=WAREHOUSE_ID,
+        statement=query,
+        wait_timeout="10s"
+    )
+
+    if not result.result or not result.result.data_array:
+        return []
+
+    return result.result.data_array
+
 
 def run_insert(query):
-    with sql.connect(
-        server_hostname=SERVER_HOSTNAME,
-        http_path=HTTP_PATH,
-        access_token=ACCESS_TOKEN,
-    ) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(query)
+    w.statement_execution.execute_statement(
+        warehouse_id=WAREHOUSE_ID,
+        statement=query,
+        wait_timeout="10s"
+    )
+
+# -------------------------
+# PEGAR TOKEN
+# -------------------------
+params = st.query_params
+token = params.get("token")
+
+if isinstance(token, list):
+    token = token[0]
+
+if not token:
+    st.error("Link inválido")
+    st.stop()
 
 # -------------------------
 # BUSCAR REUNIÃO
 # -------------------------
 query = f"""
-SELECT meet_link, titulo, horario
-FROM hsl_prod.bronzev2.apost_meetings
-WHERE meeting_id = '{meeting_id}'
+SELECT 
+    meeting_id,
+    titulo,
+    horario,
+    meet_link,
+    ativo,
+    expira_em
+FROM meetings
+WHERE hash_link = '{token}'
 """
 
-rows, columns = run_query(query)
+rows = run_query(query)
 
 if not rows:
     st.error("Reunião não encontrada")
     st.stop()
 
-row_dict = dict(zip(columns, rows[0]))
+row = rows[0]
 
-meet_link = str(row_dict["meet_link"]).strip()
-titulo = row_dict["titulo"]
-horario = row_dict["horario"]
-
-# -------------------------
-# INFO
-# -------------------------
-st.subheader(f"Reunião: {titulo}")
-st.caption(f"Horário: {horario}")
+meeting_id = row[0]
+titulo = row[1]
+horario = row[2]
+meet_link = str(row[3]).strip()
+ativo = row[4]
+expira_em = row[5]
 
 # -------------------------
-# ⏰ CONTROLE DE HORÁRIO
+# VALIDAÇÕES DE ACESSO
 # -------------------------
-horario_dt = datetime.fromisoformat(horario.replace("Z", ""))
+if not ativo:
+    st.error("🚫 Este link foi desativado.")
+    st.stop()
+
 agora = datetime.utcnow()
+
+# expiração
+if expira_em:
+    expira_dt = datetime.fromisoformat(str(expira_em).replace("Z", ""))
+    if agora > expira_dt:
+        st.error("⏰ Este link expirou.")
+        st.stop()
+
+# controle de horário
+horario_dt = datetime.fromisoformat(str(horario).replace("Z", ""))
 
 inicio = horario_dt - timedelta(minutes=5)
 fim = horario_dt + timedelta(hours=1)
@@ -96,11 +110,17 @@ if agora < inicio:
     st.stop()
 
 if agora > fim:
-    st.error("❌ O acesso já foi encerrado.")
+    st.error("❌ O acesso a essa reunião já foi encerrado.")
     st.stop()
 
 # -------------------------
-# VALIDAR CPF
+# INFO
+# -------------------------
+st.subheader(f"Reunião: {titulo}")
+st.caption(f"Horário: {horario_dt.strftime('%d/%m %H:%M')}")
+
+# -------------------------
+# VALIDAÇÃO CPF
 # -------------------------
 def validar_cpf(cpf):
     cpf = re.sub(r'\D', '', cpf)
@@ -113,12 +133,23 @@ nome = st.text_input("Nome completo")
 email = st.text_input("Email")
 cpf = st.text_input("CPF")
 
-st.caption("Seus dados são usados apenas para identificação.")
+st.caption("Seus dados são usados apenas para identificação na reunião.")
 
 # -------------------------
-# SALVAR
+# SALVAR + REDIRECIONAR
 # -------------------------
 if st.button("Entrar na reunião"):
+
+    # 🔁 valida horário novamente (segurança)
+    agora = datetime.utcnow()
+
+    if agora < inicio:
+        st.error("⏳ A reunião ainda não começou.")
+        st.stop()
+
+    if agora > fim:
+        st.error("❌ O acesso à reunião foi encerrado.")
+        st.stop()
 
     if not nome or not email or not cpf:
         st.warning("Preencha todos os campos")
@@ -129,7 +160,7 @@ if st.button("Entrar na reunião"):
         st.stop()
 
     insert = f"""
-    INSERT INTO hsl_prod.bronzev2.apost_meet_respostas
+    INSERT INTO meet_respostas
     VALUES (
         '{meeting_id}',
         '{nome}',
@@ -139,10 +170,10 @@ if st.button("Entrar na reunião"):
     )
     """
 
-    with st.spinner("Entrando..."):
+    with st.spinner("Entrando na reunião..."):
         run_insert(insert)
 
-    st.success("Redirecionando...")
+    st.success("Tudo certo! Redirecionando...")
 
     st.markdown(
         f'<meta http-equiv="refresh" content="2;url={meet_link}">',
