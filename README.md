@@ -59,7 +59,7 @@ https://<app-url>/?token=<hash_link>
 * Dashboard de presença
 * Controle de duplicidade por CPF
 * Envio automático de links
-* Integração com CRM
+
 
 ## Autora
 
